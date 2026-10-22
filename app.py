@@ -43,7 +43,7 @@ class ProcessingError(Exception):
 
 
 def password_mapping() -> dict[str, str]:
-    """Read des passwords from Streamlit Secrets, never from source code."""
+    """Read destination passwords from Streamlit Secrets, never from source code."""
     if "manifest_passwords" not in st.secrets:
         return {}
     try:
@@ -53,14 +53,14 @@ def password_mapping() -> dict[str, str]:
         return {}
 
 
-def decrypt_if_needed(file_bytes: bytes, des_code: str, passwords: dict[str, str]) -> bytes:
+def decrypt_if_needed(file_bytes: bytes, destination_code: str, passwords: dict[str, str]) -> bytes:
     if file_bytes.startswith(OLE_SIGNATURE):
-        if des_code not in DESTINATION_CODES:
+        if destination_code not in DESTINATION_CODES:
             raise ProcessingError("This file requires an opening password. Enter the matching three-character destination code, such as SAL.")
-        password = passwords.get(des_code)
+        password = passwords.get(destination_code)
         if not password:
             raise ProcessingError(
-                "No password is configured for this des. Add its password to the [manifest_passwords] section in Streamlit Secrets and try again."
+                "No password is configured for this destination. Add its password to the [manifest_passwords] section in Streamlit Secrets and try again."
             )
 
         try:
@@ -236,14 +236,14 @@ def apply_font_size_and_print_settings(workbook) -> None:
 def process_workbook(
     file_bytes: bytes,
     file_name: str,
-    branch_code: str,
+    destination_code: str,
     passwords: dict[str, str],
 ) -> tuple[bytes, str, dict[str, dict[str, object]]]:
     suffix = Path(file_name).suffix.lower()
     if suffix not in (".xlsx", ".xlsm"):
         raise ProcessingError("Only .xlsx and .xlsm files are supported.")
 
-    workbook_bytes = decrypt_if_needed(file_bytes, branch_code, passwords)
+    workbook_bytes = decrypt_if_needed(file_bytes, destination_code, passwords)
     try:
         workbook = load_workbook(
             io.BytesIO(workbook_bytes),
@@ -304,10 +304,10 @@ def safe_output_name(awb: str, extension: str) -> str:
 def main() -> None:
     st.set_page_config(page_title="Manifest Excel Cleaner", page_icon="📄", layout="centered")
     st.title("Manifest Excel Cleaner")
-    st.write("Upload an Excel file, unlock it with a branch code if needed, remove duplicate BG Numbers and sensitive terms from product descriptions, then download the result.")
+    st.write("Upload an Excel file, unlock it with a destination code if needed, remove duplicate BG Numbers and sensitive terms from product descriptions, then download the result.")
 
     uploaded_file = st.file_uploader("Upload a manifest (.xlsx or .xlsm)", type=["xlsx", "xlsm"])
-    branch_code = st.text_input("Three-character branch code", max_chars=3, placeholder="e.g. SAL").strip().upper()
+    destination_code = st.text_input("Three-character destination code", max_chars=3, placeholder="e.g. SAL").strip().upper()
     awb = st.text_input("Export AWB#", placeholder="e.g. 810-51887706").strip()
 
     if st.button("Process and generate file", type="primary", use_container_width=True):
@@ -315,14 +315,14 @@ def main() -> None:
             st.error("Upload a manifest file first.")
         elif not awb:
             st.error("Enter an export AWB#.")
-        elif branch_code and len(branch_code) != 3:
-            st.error("The branch code must contain exactly three characters.")
+        elif destination_code and len(destination_code) != 3:
+            st.error("The destination code must contain exactly three characters.")
         else:
             try:
                 output_bytes, extension, summaries = process_workbook(
                     uploaded_file.getvalue(),
                     uploaded_file.name,
-                    branch_code,
+                    destination_code,
                     password_mapping(),
                 )
                 output_name = safe_output_name(awb, extension)
