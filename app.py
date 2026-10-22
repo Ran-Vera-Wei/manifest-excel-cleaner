@@ -15,7 +15,7 @@ from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.utils import get_column_letter, range_boundaries
 
 
-BRANCH_CODES = ("EZE", "GUA", "SAL", "LIM", "SJO", "VCP", "SCL", "POS", "SAP", "UIO")
+DESTINATION_CODES = ("EZE", "GUA", "SAL", "LIM", "SJO", "VCP", "SCL", "POS", "SAP", "UIO")
 OLE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
 SENSITIVE_TERMS = (
     "ALCOHOL",
@@ -43,7 +43,7 @@ class ProcessingError(Exception):
 
 
 def password_mapping() -> dict[str, str]:
-    """Read branch passwords from Streamlit Secrets, never from source code."""
+    """Read des passwords from Streamlit Secrets, never from source code."""
     if "manifest_passwords" not in st.secrets:
         return {}
     try:
@@ -53,14 +53,14 @@ def password_mapping() -> dict[str, str]:
         return {}
 
 
-def decrypt_if_needed(file_bytes: bytes, branch_code: str, passwords: dict[str, str]) -> bytes:
+def decrypt_if_needed(file_bytes: bytes, des_code: str, passwords: dict[str, str]) -> bytes:
     if file_bytes.startswith(OLE_SIGNATURE):
-        if branch_code not in BRANCH_CODES:
-            raise ProcessingError("This file requires an opening password. Enter the matching three-character branch code, such as SAL.")
-        password = passwords.get(branch_code)
+        if des_code not in DESTINATION_CODES:
+            raise ProcessingError("This file requires an opening password. Enter the matching three-character destination code, such as SAL.")
+        password = passwords.get(des_code)
         if not password:
             raise ProcessingError(
-                "No password is configured for this branch. Add its password to the [manifest_passwords] section in Streamlit Secrets and try again."
+                "No password is configured for this des. Add its password to the [manifest_passwords] section in Streamlit Secrets and try again."
             )
 
         try:
@@ -74,7 +74,7 @@ def decrypt_if_needed(file_bytes: bytes, branch_code: str, passwords: dict[str, 
         except ProcessingError:
             raise
         except Exception as exc:
-            raise ProcessingError("Unable to open the file. Check the three-character branch code and confirm its password is configured in Secrets.") from exc
+            raise ProcessingError("Unable to open the file. Check the three-character destination code and confirm its password is configured in Secrets.") from exc
 
     if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
         raise ProcessingError("Only .xlsx and .xlsm files are supported. Upload a valid Excel workbook.")
