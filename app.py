@@ -9,13 +9,15 @@ from pathlib import Path
 
 import msoffcrypto
 import streamlit as st
-from openpyxl import load_workbook
+import xlrd
+from openpyxl import Workbook, load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.worksheet.properties import PageSetupProperties
-from openpyxl.utils import get_column_letter, range_boundaries
+from openpyxl.utils import column_index_from_string, get_column_letter, range_boundaries
 
 
 DESTINATION_CODES = ("EZE", "GUA", "SAL", "LIM", "SJO", "VCP", "SCL", "POS", "SAP", "UIO")
+CLIENTS = ("TEMU", "JTExpress", "BDT")
 OLE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
 SENSITIVE_TERMS = (
     "ALCOHOL",
@@ -53,8 +55,26 @@ def password_mapping() -> dict[str, str]:
         return {}
 
 
-def decrypt_if_needed(file_bytes: bytes, destination_code: str, passwords: dict[str, str]) -> bytes:
+def decrypt_if_needed(
+    file_bytes: bytes,
+    file_suffix: str,
+    destination_code: str,
+    passwords: dict[str, str],
+) -> bytes:
     if file_bytes.startswith(OLE_SIGNATURE):
+        try:
+            encrypted = msoffcrypto.OfficeFile(io.BytesIO(file_bytes))
+            is_encrypted = encrypted.is_encrypted()
+        except Exception:
+            if file_suffix == ".xls":
+                return file_bytes
+            raise ProcessingError("This file is not a supported encrypted Excel workbook.")
+
+        if not is_encrypted:
+            if file_suffix == ".xls":
+                return file_bytes
+            raise ProcessingError("This file is not a supported encrypted Excel workbook.")
+
         if destination_code not in DESTINATION_CODES:
             raise ProcessingError("This file requires an opening password. Enter the matching three-character destination code, such as SAL.")
         password = passwords.get(destination_code)
@@ -64,9 +84,6 @@ def decrypt_if_needed(file_bytes: bytes, destination_code: str, passwords: dict[
             )
 
         try:
-            encrypted = msoffcrypto.OfficeFile(io.BytesIO(file_bytes))
-            if not encrypted.is_encrypted():
-                raise ProcessingError("This file is not a supported encrypted Excel workbook.")
             encrypted.load_key(password=password, verify_password=True)
             decrypted = io.BytesIO()
             encrypted.decrypt(decrypted)
@@ -77,7 +94,7 @@ def decrypt_if_needed(file_bytes: bytes, destination_code: str, passwords: dict[
             raise ProcessingError("Unable to open the file. Check the three-character destination code and confirm its password is configured in Secrets.") from exc
 
     if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
-        raise ProcessingError("Only .xlsx and .xlsm files are supported. Upload a valid Excel workbook.")
+        raise ProcessingError("Only .xlsx, .xlsm, and .xls files are supported. Upload a valid Excel workbook.")
     return file_bytes
 
 
@@ -87,20 +104,43 @@ def normalized_header(value: object) -> str:
     return re.sub(r"\s+", " ", str(value)).strip().casefold()
 
 
-def find_manifest_header(ws) -> int | None:
+def find_client_headers(ws, client: str) -> tuple[int, int, int] | None:
     for row_number in range(1, min(ws.max_row, 100) + 1):
-        bg_header = normalized_header(ws.cell(row=row_number, column=3).value)
-        description_header = normalized_header(ws.cell(row=row_number, column=15).value)
-        if bg_header == "bg number" and description_header == "product description":
-            return row_number
+        headers = {
+            normalized_header(ws.cell(row=row_number, column=column).value): column
+            for column in range(1, ws.max_column + 1)
+            if normalized_header(ws.cell(row=row_number, column=column).value)
+        }
+
+        if client == "TEMU":
+            if (
+                normalized_header(ws.cell(row=row_number, column=3).value) == "bg number"
+                and normalized_header(ws.cell(row=row_number, column=15).value) == "product description"
+            ):
+                return row_number, 3, 15
+            continue
+
+        if client == "JTExpress":
+            dedupe_header = "tracking no."
+            description_headers = ("content description", "product description")
+        elif client == "BDT":
+            dedupe_header = "tracking number"
+            description_headers = ("product description", "content description")
+        else:
+            raise ProcessingError(f"Unsupported client: {client}")
+
+        dedupe_column = headers.get(dedupe_header)
+        description_column = next((headers[name] for name in description_headers if name in headers), None)
+        if dedupe_column is not None and description_column is not None:
+            return row_number, dedupe_column, description_column
     return None
 
 
-def remove_duplicate_bg_rows(ws, header_row: int) -> int:
+def remove_duplicate_rows(ws, header_row: int, key_column: int) -> int:
     seen: set[str] = set()
     rows_to_remove: list[int] = []
     for row_number in range(header_row + 1, ws.max_row + 1):
-        value = ws.cell(row=row_number, column=3).value
+        value = ws.cell(row=row_number, column=key_column).value
         if value is None or not str(value).strip():
             continue
         key = str(value).strip().casefold()
@@ -174,10 +214,100 @@ def remove_duplicate_bg_rows(ws, header_row: int) -> int:
     return len(rows_to_remove)
 
 
-def remove_sensitive_terms(ws, header_row: int) -> dict[str, int]:
+def remove_header_only_columns(ws, header_row: int, protected_columns: set[int]) -> int:
+    columns_to_remove = []
+    for column in range(1, ws.max_column + 1):
+        header_value = ws.cell(row=header_row, column=column).value
+        if column in protected_columns or header_value is None or not str(header_value).strip():
+            continue
+        if all(
+            ws.cell(row=row_number, column=column).value is None
+            or not str(ws.cell(row=row_number, column=column).value).strip()
+            for row_number in range(header_row + 1, ws.max_row + 1)
+        ):
+            columns_to_remove.append(column)
+
+    if not columns_to_remove:
+        return 0
+
+    first_removed_column = columns_to_remove[0]
+    if any(cell.data_type == "f" for cell in ws._cells.values()):
+        raise ProcessingError(
+            f"Worksheet '{ws.title}' contains formulas. Convert them to values before removing header-only columns."
+        )
+    if any(merged.max_col >= first_removed_column for merged in ws.merged_cells.ranges):
+        raise ProcessingError(
+            f"Worksheet '{ws.title}' contains merged cells at or after columns being removed. Unmerge them before processing."
+        )
+    if ws.conditional_formatting or ws.data_validations.dataValidation:
+        raise ProcessingError(
+            f"Worksheet '{ws.title}' contains conditional formatting or data validation. Remove these rules before removing columns."
+        )
+
+    removed_set = set(columns_to_remove)
+
+    def remap_column(column: int) -> int | None:
+        removed_before = bisect_left(columns_to_remove, column)
+        if removed_before < len(columns_to_remove) and columns_to_remove[removed_before] == column:
+            return None
+        return column - removed_before
+
+    # Compact cells once, preserving their styles while removing every header-only column.
+    compacted_cells = {}
+    for (row_number, old_column), cell in ws._cells.items():
+        new_column = remap_column(old_column)
+        if new_column is None:
+            continue
+        if new_column != old_column:
+            cell.column = new_column
+        compacted_cells[(row_number, new_column)] = cell
+    ws._cells = compacted_cells
+
+    old_dimensions = list(ws.column_dimensions.items())
+    ws.column_dimensions.clear()
+    for key, dimension in old_dimensions:
+        first_column = dimension.min or column_index_from_string(key)
+        last_column = dimension.max or first_column
+        for old_column in range(first_column, last_column + 1):
+            new_column = remap_column(old_column)
+            if new_column is None:
+                continue
+            new_dimension = copy(dimension)
+            new_dimension.min = new_column
+            new_dimension.max = new_column
+            new_dimension.index = get_column_letter(new_column)
+            ws.column_dimensions[new_dimension.index] = new_dimension
+
+    def remap_reference(reference: str | None) -> str | None:
+        if not reference:
+            return reference
+        min_column, min_row, max_column, max_row = range_boundaries(reference)
+        retained_columns = [
+            remap_column(column)
+            for column in range(min_column, max_column + 1)
+            if column not in removed_set
+        ]
+        retained_columns = [column for column in retained_columns if column is not None]
+        if not retained_columns:
+            return None
+        return (
+            f"{get_column_letter(min(retained_columns))}{min_row}:"
+            f"{get_column_letter(max(retained_columns))}{max_row}"
+        )
+
+    if ws.auto_filter.ref:
+        ws.auto_filter.ref = remap_reference(ws.auto_filter.ref)
+    for table in ws.tables.values():
+        table.ref = remap_reference(table.ref)
+        if table.autoFilter is not None:
+            table.autoFilter.ref = table.ref
+    return len(columns_to_remove)
+
+
+def remove_sensitive_terms(ws, header_row: int, description_column: int) -> dict[str, int]:
     counts = {term: 0 for term in SENSITIVE_TERMS}
     for row_number in range(header_row + 1, ws.max_row + 1):
-        cell = ws.cell(row=row_number, column=15)
+        cell = ws.cell(row=row_number, column=description_column)
         if not isinstance(cell.value, str) or cell.data_type == "f":
             continue
         cleaned = cell.value
@@ -188,6 +318,66 @@ def remove_sensitive_terms(ws, header_row: int) -> dict[str, int]:
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
         cell.value = cleaned
     return counts
+
+
+def load_legacy_xls(file_bytes: bytes) -> Workbook:
+    try:
+        source_book = xlrd.open_workbook(file_contents=file_bytes, formatting_info=True)
+    except xlrd.XLRDError as exc:
+        raise ProcessingError(
+            "Unable to read this .xls workbook. If it is password-protected, open it in Excel and save an unprotected .xlsx copy first."
+        ) from exc
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    for source_sheet in source_book.sheets():
+        sheet_title = source_sheet.name[:31] or "Sheet"
+        ws = workbook.create_sheet(title=sheet_title)
+        if getattr(source_sheet, "visibility", 0) == 1:
+            ws.sheet_state = "hidden"
+
+        for row_index in range(source_sheet.nrows):
+            for column_index in range(source_sheet.ncols):
+                source_cell = source_sheet.cell(row_index, column_index)
+                if source_cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                    continue
+
+                if source_cell.ctype == xlrd.XL_CELL_DATE:
+                    value = xlrd.xldate_as_datetime(source_cell.value, source_book.datemode)
+                elif source_cell.ctype == xlrd.XL_CELL_ERROR:
+                    value = str(source_cell.value)
+                else:
+                    value = source_cell.value
+
+                target_cell = ws.cell(row=row_index + 1, column=column_index + 1, value=value)
+                xf = source_book.xf_list[source_cell.xf_index]
+                cell_format = source_book.format_map.get(xf.format_key)
+                if cell_format is not None:
+                    target_cell.number_format = cell_format.format_str
+
+        for column_index, column_info in source_sheet.colinfo_map.items():
+            dimension = ws.column_dimensions[get_column_letter(column_index + 1)]
+            dimension.width = column_info.width / 256
+            dimension.hidden = bool(column_info.hidden)
+
+        for row_index, row_info in source_sheet.rowinfo_map.items():
+            dimension = ws.row_dimensions[row_index + 1]
+            if row_info.height != 0xFFFF:
+                dimension.height = row_info.height / 20
+            dimension.hidden = bool(row_info.hidden)
+
+        for row_start, row_end, column_start, column_end in source_sheet.merged_cells:
+            ws.merge_cells(
+                start_row=row_start + 1,
+                end_row=row_end,
+                start_column=column_start + 1,
+                end_column=column_end,
+            )
+
+    if not workbook.worksheets:
+        workbook.create_sheet("Sheet1")
+    return workbook
 
 
 def apply_font_size_and_print_settings(workbook) -> None:
@@ -236,40 +426,64 @@ def apply_font_size_and_print_settings(workbook) -> None:
 def process_workbook(
     file_bytes: bytes,
     file_name: str,
+    client: str,
     destination_code: str,
     passwords: dict[str, str],
 ) -> tuple[bytes, str, dict[str, dict[str, object]]]:
     suffix = Path(file_name).suffix.lower()
-    if suffix not in (".xlsx", ".xlsm"):
-        raise ProcessingError("Only .xlsx and .xlsm files are supported.")
+    if suffix not in (".xlsx", ".xlsm", ".xls"):
+        raise ProcessingError("Only .xlsx, .xlsm, and .xls files are supported.")
+    if client not in CLIENTS:
+        raise ProcessingError(f"Unsupported client: {client}")
 
-    workbook_bytes = decrypt_if_needed(file_bytes, destination_code, passwords)
-    try:
-        workbook = load_workbook(
-            io.BytesIO(workbook_bytes),
-            data_only=False,
-            keep_vba=suffix == ".xlsm",
-        )
-    except Exception as exc:
-        raise ProcessingError("Unable to read the Excel workbook. Confirm that the file is not damaged and is in .xlsx or .xlsm format.") from exc
+    workbook_bytes = decrypt_if_needed(file_bytes, suffix, destination_code, passwords)
+    if suffix == ".xls":
+        workbook = load_legacy_xls(workbook_bytes)
+    else:
+        try:
+            workbook = load_workbook(
+                io.BytesIO(workbook_bytes),
+                data_only=False,
+                keep_vba=suffix == ".xlsm",
+            )
+        except Exception as exc:
+            raise ProcessingError("Unable to read the Excel workbook. Confirm that the file is not damaged and is in .xlsx or .xlsm format.") from exc
 
     summaries: dict[str, dict[str, object]] = {}
     matching_sheets = []
     for ws in workbook.worksheets:
-        header_row = find_manifest_header(ws)
-        if header_row is None:
+        headers = find_client_headers(ws, client)
+        if headers is None:
             continue
-        matching_sheets.append((ws, header_row))
+        matching_sheets.append((ws, *headers))
 
     if not matching_sheets:
+        expected_headers = {
+            "TEMU": "column C = BG Number and column O = PRODUCT DESCRIPTION",
+            "JTExpress": "TRACKING NO. and CONTENT DESCRIPTION (or PRODUCT DESCRIPTION)",
+            "BDT": "Tracking Number and PRODUCT DESCRIPTION",
+        }[client]
         raise ProcessingError(
-            "Could not find the expected headers. Confirm that a row has 'BG Number' in column C and 'PRODUCT DESCRIPTION' in column O."
+            f"Could not find the expected {client} headers. Confirm that one row contains {expected_headers}."
         )
 
-    for ws, header_row in matching_sheets:
-        duplicates_removed = remove_duplicate_bg_rows(ws, header_row)
-        terms_removed = remove_sensitive_terms(ws, header_row)
+    for ws, header_row, key_column, description_column in matching_sheets:
+        columns_removed = 0
+        if client in ("JTExpress", "BDT"):
+            columns_removed = remove_header_only_columns(
+                ws,
+                header_row,
+                protected_columns={key_column, description_column},
+            )
+            refreshed_headers = find_client_headers(ws, client)
+            if refreshed_headers is None:
+                raise ProcessingError(f"Could not find the expected headers after removing empty columns from worksheet '{ws.title}'.")
+            header_row, key_column, description_column = refreshed_headers
+
+        duplicates_removed = remove_duplicate_rows(ws, header_row, key_column)
+        terms_removed = remove_sensitive_terms(ws, header_row, description_column)
         summaries[ws.title] = {
+            "Columns removed": columns_removed,
             "Duplicate rows removed": duplicates_removed,
             "Sensitive term removals": terms_removed,
         }
@@ -304,9 +518,10 @@ def safe_output_name(awb: str, extension: str) -> str:
 def main() -> None:
     st.set_page_config(page_title="Manifest Excel Cleaner", page_icon="📄", layout="centered")
     st.title("Manifest Excel Cleaner")
-    st.write("Upload an Excel file, unlock it with a destination code if needed, remove duplicate BG Numbers and sensitive terms from product descriptions, then download the result.")
+    st.write("Choose a client, upload its manifest, enter a destination code if the workbook is password-protected, and download the cleaned result.")
 
-    uploaded_file = st.file_uploader("Upload a manifest (.xlsx or .xlsm)", type=["xlsx", "xlsm"])
+    client = st.selectbox("Client", options=CLIENTS)
+    uploaded_file = st.file_uploader("Upload a manifest (.xlsx, .xlsm, or .xls)", type=["xlsx", "xlsm", "xls"])
     destination_code = st.text_input("Three-character destination code", max_chars=3, placeholder="e.g. SAL").strip().upper()
     awb = st.text_input("Export AWB#", placeholder="e.g. 810-51887706").strip()
 
@@ -322,6 +537,7 @@ def main() -> None:
                 output_bytes, extension, summaries = process_workbook(
                     uploaded_file.getvalue(),
                     uploaded_file.name,
+                    client,
                     destination_code,
                     password_mapping(),
                 )
@@ -329,6 +545,8 @@ def main() -> None:
                 st.success("Processing complete. The output workbook is not protected with an opening password.")
                 for sheet_name, summary in summaries.items():
                     st.subheader(sheet_name)
+                    if summary["Columns removed"]:
+                        st.write(f"Header-only columns removed: {summary['Columns removed']}")
                     st.write(f"Duplicate rows removed: {summary['Duplicate rows removed']}")
                     term_counts = summary["Sensitive term removals"]
                     st.write("Sensitive term removals: " + "; ".join(f"{term}: {count}" for term, count in term_counts.items()))
