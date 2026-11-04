@@ -16,7 +16,7 @@ from openpyxl.worksheet.properties import PageSetupProperties
 from openpyxl.utils import column_index_from_string, get_column_letter, range_boundaries
 
 
-DESTINATION_CODES = ("EZE", "GUA", "SAL", "LIM", "SJO", "VCP", "SCL", "POS", "SAP", "UIO")
+DESTINATION_CODES = ("EZE", "GUA", "SAL", "LIM", "SJO", "VCP", "SCL", "POS", "SAP", "UIO", "KIN")
 CLIENTS = ("TEMU", "JTExpress", "BDT")
 OLE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
 SENSITIVE_TERMS = (
