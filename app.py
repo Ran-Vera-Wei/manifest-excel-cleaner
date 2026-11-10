@@ -136,6 +136,104 @@ def find_client_headers(ws, client: str) -> tuple[int, int, int] | None:
     return None
 
 
+def remove_blank_rows(ws) -> int:
+    populated_rows = sorted(
+        {
+            cell.row
+            for cell in ws._cells.values()
+            if not isinstance(cell, MergedCell)
+            and cell.value is not None
+            and (not isinstance(cell.value, str) or cell.value.strip())
+        }
+    )
+    if not populated_rows:
+        return 0
+
+    blank_ranges: list[tuple[int, int]] = []
+    if populated_rows[0] > 1:
+        blank_ranges.append((1, populated_rows[0] - 1))
+    for previous_row, next_row in zip(populated_rows, populated_rows[1:]):
+        if next_row > previous_row + 1:
+            blank_ranges.append((previous_row + 1, next_row - 1))
+    if ws.max_row > populated_rows[-1]:
+        blank_ranges.append((populated_rows[-1] + 1, ws.max_row))
+    if not blank_ranges:
+        return 0
+
+    first_blank_row = blank_ranges[0][0]
+    if any(cell.data_type == "f" for cell in ws._cells.values()):
+        raise ProcessingError(
+            f"Worksheet '{ws.title}' contains formulas. Convert them to values before removing blank rows so formula references remain correct."
+        )
+    if any(merged.max_row >= first_blank_row for merged in ws.merged_cells.ranges):
+        raise ProcessingError(
+            f"Worksheet '{ws.title}' contains merged cells at or below blank rows. Unmerge them before processing."
+        )
+    if ws.conditional_formatting or ws.data_validations.dataValidation:
+        raise ProcessingError(
+            f"Worksheet '{ws.title}' contains conditional formatting or data validation. Remove these rules before removing blank rows."
+        )
+
+    range_starts = [start for start, _ in blank_ranges]
+    range_ends = [end for _, end in blank_ranges]
+    cumulative_removed: list[int] = []
+    total_removed = 0
+    for start, end in blank_ranges:
+        total_removed += end - start + 1
+        cumulative_removed.append(total_removed)
+
+    def remap_row(row_number: int) -> int | None:
+        range_index = bisect_left(range_starts, row_number)
+        if range_index < len(blank_ranges) and range_starts[range_index] == row_number:
+            return None
+        previous_range = range_index - 1
+        if previous_range >= 0 and row_number <= range_ends[previous_range]:
+            return None
+        removed_before = cumulative_removed[previous_range] if previous_range >= 0 else 0
+        return row_number - removed_before
+
+    compacted_cells = {}
+    for (old_row, column), cell in ws._cells.items():
+        new_row = remap_row(old_row)
+        if new_row is None:
+            continue
+        if new_row != old_row:
+            cell.row = new_row
+        compacted_cells[(new_row, column)] = cell
+    ws._cells = compacted_cells
+
+    old_dimensions = list(ws.row_dimensions.items())
+    ws.row_dimensions.clear()
+    for old_row, dimension in old_dimensions:
+        new_row = remap_row(old_row)
+        if new_row is None:
+            continue
+        dimension.index = new_row
+        ws.row_dimensions[new_row] = dimension
+
+    if ws.auto_filter.ref:
+        min_col, min_row, max_col, max_row = range_boundaries(ws.auto_filter.ref)
+        new_min_row = remap_row(min_row)
+        new_max_row = remap_row(max_row)
+        if new_min_row is not None and new_max_row is not None:
+            ws.auto_filter.ref = (
+                f"{get_column_letter(min_col)}{new_min_row}:"
+                f"{get_column_letter(max_col)}{new_max_row}"
+            )
+    for table in ws.tables.values():
+        min_col, min_row, max_col, max_row = range_boundaries(table.ref)
+        new_min_row = remap_row(min_row)
+        new_max_row = remap_row(max_row)
+        if new_min_row is not None and new_max_row is not None:
+            table.ref = (
+                f"{get_column_letter(min_col)}{new_min_row}:"
+                f"{get_column_letter(max_col)}{new_max_row}"
+            )
+            if table.autoFilter is not None:
+                table.autoFilter.ref = table.ref
+    return total_removed
+
+
 def remove_duplicate_rows(ws, header_row: int, key_column: int) -> int:
     seen: set[str] = set()
     rows_to_remove: list[int] = []
@@ -468,6 +566,12 @@ def process_workbook(
         )
 
     for ws, header_row, key_column, description_column in matching_sheets:
+        blank_rows_removed = remove_blank_rows(ws)
+        refreshed_headers = find_client_headers(ws, client)
+        if refreshed_headers is None:
+            raise ProcessingError(f"Could not find the expected headers after removing blank rows from worksheet '{ws.title}'.")
+        header_row, key_column, description_column = refreshed_headers
+
         columns_removed = 0
         if client in ("JTExpress", "BDT"):
             columns_removed = remove_header_only_columns(
@@ -483,6 +587,7 @@ def process_workbook(
         duplicates_removed = remove_duplicate_rows(ws, header_row, key_column)
         terms_removed = remove_sensitive_terms(ws, header_row, description_column)
         summaries[ws.title] = {
+            "Blank rows removed": blank_rows_removed,
             "Columns removed": columns_removed,
             "Duplicate rows removed": duplicates_removed,
             "Sensitive term removals": terms_removed,
@@ -545,6 +650,7 @@ def main() -> None:
                 st.success("Processing complete. The output workbook is not protected with an opening password.")
                 for sheet_name, summary in summaries.items():
                     st.subheader(sheet_name)
+                    st.write(f"Blank rows removed: {summary['Blank rows removed']}")
                     if summary["Columns removed"]:
                         st.write(f"Header-only columns removed: {summary['Columns removed']}")
                     st.write(f"Duplicate rows removed: {summary['Duplicate rows removed']}")

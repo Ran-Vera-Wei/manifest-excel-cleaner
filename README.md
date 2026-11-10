@@ -32,6 +32,7 @@ A Python application that runs locally or on Streamlit Community Cloud. It accep
 ## Features
 
 - Choose a client: **TEMU**, **JTExpress**, or **BDT**.
+- Remove fully blank rows from each matched manifest worksheet before deduplicating rows. Cells containing only whitespace count as blank.
 - TEMU keeps its current rules: remove duplicates by column C, `BG Number`, and remove sensitive terms from column O, `PRODUCT DESCRIPTION`.
 - JTExpress removes columns whose only non-empty value is the header, removes duplicate rows by `TRACKING NO.`, and removes sensitive terms from `CONTENT DESCRIPTION` (or `PRODUCT DESCRIPTION` when present).
 - BDT removes columns whose only non-empty value is the header, removes duplicate rows by `Tracking Number`, and removes sensitive terms from `PRODUCT DESCRIPTION`.
